@@ -38,7 +38,7 @@ st.set_page_config(
     page_title="ZÜS PDF Renamer",
     page_icon="📄",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -721,7 +721,6 @@ def main() -> None:
         )
 
     # ── FILE UPLOADER ─────────────────────────────────────────────────────────
-    st.markdown('<div class="analysis-card">', unsafe_allow_html=True)
     st.markdown("### 📂 Upload ZÜS Inspection PDFs")
     st.markdown(
         "<p style='color:#6b7280;font-size:0.9rem;margin-top:-8px;'>"
@@ -746,8 +745,6 @@ def main() -> None:
             f'<span class="filename-tag">📄 {f.name}</span>' for f in uploaded_files
         )
         st.markdown(pills, unsafe_allow_html=True)
-
-    st.markdown("</div>", unsafe_allow_html=True)
 
     # ── PROCESS BUTTON ────────────────────────────────────────────────────────
     col_l, col_c, col_r = st.columns([1, 2, 1])
