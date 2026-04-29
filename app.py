@@ -705,8 +705,7 @@ def main() -> None:
         <div style="text-align:center;padding:2.5rem 0 1.5rem 0;">
             <div class="hero-title">ZÜS PDF Renamer</div>
             <div class="hero-subtitle">
-                Upload ZÜS inspection reports and get them automatically renamed<br>
-                using Azure Document Intelligence + Azure OpenAI o4-mini.
+                Upload ZÜS inspection reports and get them automatically renamed.
             </div>
         </div>
         """,
@@ -785,7 +784,7 @@ def main() -> None:
             for idx, pdf_file in enumerate(uploaded_files):
                 frac = idx / len(uploaded_files)
                 progress_bar.progress(frac, text=f"Processing {pdf_file.name}  ({idx + 1}/{len(uploaded_files)})…")
-                status_slot.info(f"⏳  Stage 1/4 — Analysing: **{pdf_file.name}**")
+                status_slot.info(f"⏳  Processing **{pdf_file.name}**…")
 
                 file_bytes = pdf_file.read()
                 row = process_pdf(
