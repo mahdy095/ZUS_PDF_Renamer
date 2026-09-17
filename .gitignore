@@ -12,3 +12,8 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Embedded lookup tables — contain customer data, kept out of the repo.
+# Deployed via the *_TABLE_B64 entries in Streamlit secrets instead.
+DIC (ve3+type).xlsx
+Gesobau (fabrik+strasse).xlsx

@@ -9,10 +9,18 @@ Pipeline:
   Stage 3 — VE3 / Type lookup            (embedded DIC Excel)
   Stage 4 — Renamed PDF bytes + XLSX     (in-memory, downloadable)
 
-Output filename pattern:
-    {VE3}-{DDMMYYYY}-{HP|ZP|NP} {Aufzug|Fahrtreppe} {Fabriknummer}.pdf
+Two tabs, sharing the ADI stage, the Azure credentials and the admin panel:
+
+  "ZUES Renamer"  general pipeline, DIC lookup
+      {VE3}-{DDMMYYYY}-{HP|ZP|NP} {Aufzug|Fahrtreppe} {Fabriknummer}.pdf
+
+  "Gesobau_ZUES"  GESOBAU AG only, Gesobau masterlist lookup
+      {HP|ZP|NP}-{Strasse}-{Fabriknummer}.pdf
+      e.g.  HP-Senftenberger Ring 37-10987474.pdf
 """
 
+import base64
+import gzip
 import hashlib
 import io
 import logging
@@ -201,23 +209,50 @@ def check_admin(username: str, password: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  EMBEDDED DIC DATA  (auto-loads from Excel in same directory)
+#  EMBEDDED LOOKUP TABLES
+#  The tables hold customer data, so they are NOT committed to the repository.
+#  They live in Streamlit secrets as a gzipped + base64-encoded CSV; locally the
+#  original xlsx (gitignored) is used as a fallback so the dev loop is unchanged.
+#  Build a blob with:
+#      import gzip, base64, pandas as pd
+#      csv = pd.read_excel("DIC (ve3+type).xlsx").to_csv(index=False).encode()
+#      print(base64.b64encode(gzip.compress(csv, 9)).decode())
 # ══════════════════════════════════════════════════════════════════════════════
+def _load_table(secret_key: str, xlsx_filename: str) -> pd.DataFrame:
+    """Return a lookup table from st.secrets, else from the local xlsx file.
+
+    The secret holds a gzipped, base64-encoded CSV; whitespace and line breaks
+    inside it are ignored, so it can be pasted as a wrapped TOML block string.
+    Values come back as strings, which every caller already normalises with
+    str()/float(), so both paths produce identical lookups.
+    """
+    blob = ""
+    try:
+        blob = str(st.secrets.get(secret_key, "") or "")
+    except Exception:
+        pass
+
+    if blob.strip():
+        raw = gzip.decompress(base64.b64decode("".join(blob.split())))
+        return pd.read_csv(io.BytesIO(raw), dtype=str)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return pd.read_excel(os.path.join(script_dir, xlsx_filename))
+
+
 _FAHRTREPPE_TYPES = {"Fahrtreppe", "Fahrsteig"}
 
 
 @st.cache_data(show_spinner=False)
 def load_dic_data() -> tuple[dict, dict, int]:
-    """Load embedded DIC Excel and build VE3 + type lookup dicts."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    dic_path = os.path.join(script_dir, "DIC (ve3+type).xlsx")
-    df = pd.read_excel(dic_path)
+    """Load the DIC table and build VE3 + type lookup dicts."""
+    df = _load_table("DIC_TABLE_B64", "DIC (ve3+type).xlsx")
 
     df["_type"] = df["MDESIT_NAME_DE"].apply(
         lambda x: "Fahrtreppe" if x in _FAHRTREPPE_TYPES else "Aufzug"
     )
     ve3_dict = {
-        str(k): str(int(v))
+        str(k): str(int(float(v)))          # float() so "16332.0" and 16332.0 both work
         for k, v in zip(df["MDSIT_NUMBER"], df["MDSIT_VE3"])
         if pd.notna(v)
     }
@@ -574,13 +609,323 @@ def build_xlsx(results: list[dict]) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ██  GESOBAU  ████████████████████████████████████████████████████████████████
+#  Second pipeline — same ADI stage, customer-specific extraction + naming.
+#  Output filename pattern:  {HP|ZP|NP}-{Straße}-{Fabriknummer}.pdf
+#      e.g.  HP-Senftenberger Ring 37-10987474.pdf
+# ══════════════════════════════════════════════════════════════════════════════
+GESOBAU_XLSX = "Gesobau (fabrik+strasse).xlsx"
+
+
+def _fab_keys(raw: str) -> list[str]:
+    """Candidate lookup keys derived from one Fabriknummer string."""
+    raw = raw.strip()
+    out = [
+        raw,
+        re.sub(r"\s*([./-])\s*", r"\1", raw),   # "74 / 2002"  -> "74/2002"
+        raw.replace(" ", ""),                   # "4 712 3"    -> "47123"
+        raw.replace("_", "/"),
+    ]
+    seen, keys = set(), []
+    for k in out:
+        if k and k not in seen:
+            seen.add(k)
+            keys.append(k)
+    return keys
+
+
+@st.cache_data(show_spinner=False)
+def load_gesobau_data() -> tuple[dict, dict, dict, int]:
+    """Load the embedded Gesobau masterlist -> exact / upper / digits-only lookups.
+
+    Verified against the current export: no Fabriknummer maps to two different
+    streets under any of the three keyings, so the fallbacks cannot introduce
+    ambiguity. Rows without a Fabriknummer or Straße are dropped — that also
+    removes the trailing blank row and the "Applied filters:" footer row the
+    source system appends to every export.
+    """
+    df = _load_table("GESOBAU_TABLE_B64", GESOBAU_XLSX)
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(subset=["Fabriknummer", "Straße"])
+
+    exact: dict[str, str] = {}
+    upper: dict[str, str] = {}
+    digits: dict[str, str] = {}
+    for fab_raw, street_raw in zip(df["Fabriknummer"], df["Straße"]):
+        fab, street = str(fab_raw).strip(), str(street_raw).strip()
+        if not fab or not street or fab.lower() == "nan":
+            continue
+        exact.setdefault(fab, street)
+        upper.setdefault(fab.upper(), street)
+        only_digits = re.sub(r"\D", "", fab)
+        if only_digits:
+            digits.setdefault(only_digits, street)
+    return exact, upper, digits, len(exact)
+
+
+def lookup_gesobau_street(
+    fabriknummer: str | None,
+    exact: dict,
+    upper: dict,
+    digits: dict,
+) -> str | None:
+    """Multi-strategy Fabriknummer -> Straße lookup. None when not in the list."""
+    if not fabriknummer:
+        return None
+
+    keys = _fab_keys(fabriknummer)
+    for key in keys:                                # 1 — verbatim
+        if key in exact:
+            return exact[key]
+    for key in keys:                                # 2 — case-insensitive
+        if key.upper() in upper:
+            return upper[key.upper()]
+
+    only_digits = re.sub(r"\D", "", fabriknummer)   # 3 — prefix / punctuation drift
+    if only_digits and only_digits in digits:       #     (B200451 <-> 200451)
+        return digits[only_digits]
+    return None
+
+
+# ── Gesobau extraction schema ────────────────────────────────────────────────
+class GesobauRecord(BaseModel):
+    fabriknummer: str | None = Field(
+        None,
+        description=(
+            "Factory / serial number of the lift, from the field labelled 'Fabriknr.', "
+            "'Fabrik-Nr.', 'Fabriknummer', 'Herstell-Nr.' or 'Anlagen-Nr.' inside the "
+            "'Allgemeine Daten zur Anlage' block. May be digits only ('10987474', '200451') "
+            "or alphanumeric ('47NBR275', '6KF61010', 'B200451', '20041956-1'). "
+            "Return it exactly as printed — keep letters, leading zeros and internal separators."
+        ),
+    )
+    pruefungsart_raw: str | None = Field(
+        None,
+        description=(
+            "The FULL raw text of the field labelled 'Art der Prüfung' (the heading may read "
+            "'Art der Prüfung/ Prüfgrundlage'). Return only that field's value, e.g. "
+            "'Hauptprüfung inkl. Ersatzsystem', 'Zwischenprüfung', 'Nachprüfung', "
+            "'Wiederkehrende Prüfung (Hauptprüfung) - Nachprüfung'. "
+            "CRITICAL: ignore sentences elsewhere in the document such as 'Eine Nachprüfung "
+            "ist bis zum TT.MM.JJJJ erforderlich' in the Prüfergebnis — that is a future "
+            "requirement, not the type of THIS inspection. Do not abbreviate or map to a code."
+        ),
+    )
+    standort_strasse: str | None = Field(
+        None,
+        description=(
+            "Street name and house number of the lift LOCATION, from the 'Standort' field "
+            "('Senftenberger Ring 37, 13435 Berlin' -> 'Senftenberger Ring 37'). "
+            "CRITICAL: this is NOT the 'Betreiber' / 'Auftraggeber' address — that is the "
+            "GESOBAU AG head office ('Stiftsweg 1, 13187 Berlin') and must never be returned. "
+            "Exclude postal code, city and any 'GESOBAU AG WHG ###' object label. Keep "
+            "house-number suffix letters ('37', '44f', '42Q'). Null if no Standort is present."
+        ),
+    )
+    pruefdatum: date | None = Field(
+        None,
+        description=(
+            "Date the inspection was carried out ('Prüfdatum', 'Datum der Prüfung', "
+            "'Tag der Prüfung'). German DD.MM.YYYY input -> ISO 8601 YYYY-MM-DD output."
+        ),
+    )
+    zus_unternehmen: str | None = Field(
+        None,
+        description=(
+            "Name of the ZÜS inspection company — from logo, letterhead, website URL or "
+            "e-mail domain. Usually 'TÜV Thüringen' for this customer. Return exactly one of: "
+            "DEKRA | GTÜ | SGS-TÜV Saar | TÜV Austria Deutschland | TÜV Hessen | TÜV Nord | "
+            "TÜV Rheinland | TÜV Süd | TÜV Thüringen. If none match, return it as printed."
+        ),
+    )
+
+
+GESOBAU_PROMPT = """\
+You are a specialized extraction engine for ZÜS inspection reports (Prüfbescheinigungen)
+for lifts operated by the Berlin housing company GESOBAU AG. Reports come mostly from
+TÜV Thüringen, but other ZÜS may appear — handle any layout.
+
+## Input
+Markdown produced by Azure Document Intelligence layout analysis of a PDF. The source may be
+scanned or digital. Treat all input as potentially degraded:
+- Characters, words or tokens may be split, merged or transposed by OCR
+- Table structures may be flattened or columns misaligned
+- German compound words are especially prone to mid-word line breaks
+- Umlauts (ä, ö, ü, ß) may be mangled
+
+## Reconstruction examples
+| Raw (degraded)                | Extracted                | Issue                 |
+|-------------------------------|--------------------------|-----------------------|
+| "Fabrik- Nr.: 74 / 2002"      | "74/2002"                | label fused, spaces   |
+| "Anlagen-Nr 4 712 3"          | "47123"                  | digits split          |
+| "Prüfungsdaturn: 03.01.2O25"  | 2025-01-03               | OCR noise rn->m, O->0 |
+| "Haupt prüfung"               | "Hauptprüfung"           | compound word split   |
+| "Senftenberger Ring  3 7"     | "Senftenberger Ring 37"  | digits split          |
+| "Wilhelmsruher Darnm 141"     | "Wilhelmsruher Damm 141" | OCR noise rn->m       |
+
+## Two traps you MUST avoid
+
+**1. Address trap.** These documents carry TWO addresses.
+   - 'Auftraggeber' / 'Betreiber' -> GESOBAU AG head office, *Stiftsweg 1, 13187 Berlin*
+   - 'Standort' -> the building the lift actually stands in
+   Always return the Standort street. Never return Stiftsweg 1.
+
+**2. Nachprüfung trap.** The 'Prüfergebnis' section frequently contains
+   "Eine Nachprüfung ist bis zum TT.MM.JJJJ erforderlich". That is a *future* follow-up
+   requirement, not this report's own type. The inspection type is ONLY the value printed
+   under the label 'Art der Prüfung'.
+
+## Output
+Return ONLY a valid JSON object matching the provided schema.
+No prose, no explanation, no markdown fences.
+"""
+
+
+_GESOBAU_EMPTY_ROW = {
+    "original_name": "", "new_name": "", "exam_code": "", "strasse": "",
+    "fabriknummer": "", "datum": "", "pruefungsart_raw": "",
+    "zus_unternehmen": "", "status": "", "pdf_bytes": None,
+}
+
+
+def extract_gesobau_record(client: AzureOpenAI, markdown: str, deploy: str) -> GesobauRecord:
+    """Extract a GesobauRecord from ADI markdown using structured outputs."""
+    response = client.beta.chat.completions.parse(
+        model=deploy,
+        messages=[
+            {"role": "system", "content": GESOBAU_PROMPT},
+            {"role": "user",   "content": markdown},
+        ],
+        response_format=GesobauRecord,
+        max_completion_tokens=2000,
+    )
+    return response.choices[0].message.parsed
+
+
+def process_pdf_gesobau(
+    filename: str,
+    file_bytes: bytes,
+    adi_client: DocumentIntelligenceClient,
+    oai_client: AzureOpenAI,
+    deploy: str,
+    exact: dict,
+    upper: dict,
+    digits: dict,
+    existing_names: set,
+) -> dict:
+    """Run the Gesobau pipeline for one PDF. Returns a result row dict."""
+    row = {**_GESOBAU_EMPTY_ROW, "original_name": filename}
+
+    # Stage 1 — ADI -> markdown
+    try:
+        markdown = analyze_pdf_bytes(adi_client, file_bytes)
+    except Exception as exc:
+        logger.error("ADI failed for %s: %s", filename, exc)
+        row["status"] = f"ADI_ERROR – {exc}"
+        return row
+
+    if not markdown.strip():
+        row["status"] = "SKIP – empty ADI output"
+        return row
+
+    # Stage 2 — structured extraction
+    try:
+        record = extract_gesobau_record(oai_client, markdown, deploy)
+    except Exception as exc:
+        logger.error("OpenAI extraction failed for %s: %s", filename, exc)
+        row["status"] = f"OAI_ERROR – {exc}"
+        return row
+
+    # Stage 3 — Fabriknummer (as printed) -> Straße from the masterlist, falling
+    #           back to the Standort street read from the PDF itself.
+    fabrik  = (record.fabriknummer or "").strip() or "FABRIK_NOT_FOUND"
+    strasse = lookup_gesobau_street(record.fabriknummer, exact, upper, digits)
+    if not strasse:
+        strasse = (record.standort_strasse or "").strip() or "STRASSE_NOT_FOUND"
+    exam_code = map_exam_type(record.pruefungsart_raw)
+    datum     = record.pruefdatum.strftime("%d.%m.%Y") if record.pruefdatum else ""
+
+    # Stage 4 — filename + bytes
+    new_name = sanitize(f"{exam_code}-{strasse}-{fabrik}.pdf")
+    new_name = unique_name(existing_names, new_name)
+    existing_names.add(new_name)
+
+    logger.info(
+        "OK  %s  ->  %s  [ZÜS: %s | %s | %s]",
+        filename, new_name, record.zus_unternehmen, strasse, exam_code,
+    )
+
+    return {
+        "original_name":    filename,
+        "new_name":         new_name,
+        "exam_code":        exam_code,
+        "strasse":          strasse,
+        "fabriknummer":     fabrik,
+        "datum":            datum,
+        "pruefungsart_raw": record.pruefungsart_raw or "",
+        "zus_unternehmen":  record.zus_unternehmen or "",
+        "status":           "OK",
+        "pdf_bytes":        file_bytes,
+    }
+
+
+GESOBAU_COLS   = ["original_name", "new_name", "exam_code", "strasse", "fabriknummer",
+                  "datum", "pruefungsart_raw", "zus_unternehmen", "status"]
+GESOBAU_LABELS = ["Original Name", "New Name", "Exam Code", "Straße", "Fabrik-Nr.",
+                  "Prüfdatum", "Prüfungsart (raw)", "ZÜS Company", "Status"]
+
+
+def build_xlsx_gesobau(results: list[dict]) -> bytes:
+    df = pd.DataFrame([{c: r.get(c, "") for c in GESOBAU_COLS} for r in results])
+    df.columns = GESOBAU_LABELS
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False)
+    return buf.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB STYLING
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<style>
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+        background: transparent;
+        border-bottom: 1px solid #e5e7eb;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 46px;
+        padding: 0 24px;
+        border-radius: 10px 10px 0 0;
+        background: rgba(255,255,255,0.7);
+        border: 1px solid #e5e7eb;
+        border-bottom: none;
+        font-weight: 600;
+        font-size: 0.95rem;
+        color: #4b5563;
+    }
+    .stTabs [data-baseweb="tab"]:hover { background: #ffffff; color: #4f46e5; }
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%) !important;
+        color: #ffffff !important;
+        border-color: transparent !important;
+        box-shadow: 0 4px 10px rgba(99,102,241,0.28);
+    }
+    .stTabs [data-baseweb="tab-highlight"] { background: transparent; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  SESSION STATE INIT
 # ══════════════════════════════════════════════════════════════════════════════
 def init_session_state() -> None:
     defaults = {
-        "admin_authenticated": False,
-        "results": [],
-        "processing_done": False,
+        "admin_authenticated":     False,
+        "results":                 [],
+        "processing_done":         False,
+        "results_gesobau":         [],
+        "processing_done_gesobau": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -588,24 +933,312 @@ def init_session_state() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MAIN
+#  SHARED UI BUILDING BLOCKS
 # ══════════════════════════════════════════════════════════════════════════════
-def main() -> None:
-    init_session_state()
+def make_clients(creds: dict) -> tuple[DocumentIntelligenceClient, AzureOpenAI, str]:
+    adi_client = DocumentIntelligenceClient(
+        endpoint=creds["di_endpoint"],
+        credential=AzureKeyCredential(creds["di_key"]),
+    )
+    oai_client = AzureOpenAI(
+        azure_endpoint=creds["oai_endpoint"],
+        api_key=creds["oai_key"],
+        api_version=creds["oai_version"],
+    )
+    return adi_client, oai_client, creds["oai_deploy"]
 
-    # Load embedded DIC data
-    dic_ok = False
-    ve3_dict, type_dict, dic_count = {}, {}, 0
-    try:
-        ve3_dict, type_dict, dic_count = load_dic_data()
-        dic_ok = True
-    except Exception as exc:
-        logger.error("DIC load failed: %s", exc)
 
-    creds   = get_credentials()
-    creds_ok = credentials_valid(creds)
+def render_uploader(ns: str, caption: str) -> list:
+    """Drag & drop area + selected-file pills. Returns the uploaded file objects."""
+    st.markdown("### 📂 Upload ZÜS Inspection PDFs")
+    st.markdown(
+        f"<p style='color:#6b7280;font-size:0.9rem;margin-top:-8px;'>{caption}</p>",
+        unsafe_allow_html=True,
+    )
+    uploaded_files = st.file_uploader(
+        "Upload PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        key=f"upload_{ns}",
+    )
+    if uploaded_files:
+        st.markdown(
+            f"<p style='color:#374151;font-weight:600;margin-top:12px;'>"
+            f"{len(uploaded_files)} file(s) selected:</p>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            " ".join(f'<span class="filename-tag">📄 {f.name}</span>' for f in uploaded_files),
+            unsafe_allow_html=True,
+        )
+    return uploaded_files or []
 
-    # ── SIDEBAR ───────────────────────────────────────────────────────────────
+
+def run_batch(
+    uploaded_files: list,
+    process_one,
+    results_key: str,
+    live_cols: list[str],
+    live_labels: list[str],
+) -> None:
+    """Process every uploaded PDF, streaming a live result table as it goes."""
+    st.session_state[results_key] = []
+    existing_names: set = set()
+
+    progress_bar    = st.progress(0.0, text="Initialising pipeline…")
+    status_slot     = st.empty()
+    live_table_slot = st.empty()
+
+    total = len(uploaded_files)
+    for idx, pdf_file in enumerate(uploaded_files):
+        progress_bar.progress(
+            idx / total,
+            text=f"Processing {pdf_file.name}  ({idx + 1}/{total})…",
+        )
+        status_slot.info(f"⏳  Processing **{pdf_file.name}**…")
+
+        row = process_one(pdf_file.name, pdf_file.read(), existing_names)
+        st.session_state[results_key].append(row)
+
+        df_live = pd.DataFrame(
+            [{c: r.get(c, "") for c in live_cols} for r in st.session_state[results_key]]
+        )
+        df_live.columns = live_labels
+        live_table_slot.dataframe(df_live, use_container_width=True)
+
+    progress_bar.progress(1.0, text="Pipeline complete!")
+    status_slot.success(f"✅  Finished — {total} file(s) processed.")
+
+
+def render_results(
+    *,
+    results: list[dict],
+    display_cols: list[str],
+    display_labels: list[str],
+    xlsx_builder,
+    zip_name: str,
+    xlsx_name: str,
+    results_key: str,
+    done_key: str,
+    ns: str,
+) -> None:
+    """Metrics, rename mapping, errors, full table, downloads and reset."""
+    ok_rows  = [r for r in results if r["status"] == "OK"]
+    err_rows = [r for r in results if r["status"] != "OK"]
+
+    st.markdown("---")
+
+    c1, c2, c3 = st.columns(3)
+    for col, value, color, label in (
+        (c1, len(results),  "#6366f1", "Files Processed"),
+        (c2, len(ok_rows),  "#10b981", "Successfully Renamed"),
+        (c3, len(err_rows), "#ef4444", "Errors / Skipped"),
+    ):
+        with col:
+            st.markdown(
+                f'<div class="metric-card"><div class="metric-number" style="color:{color};">'
+                f'{value}</div><div class="metric-label">{label}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    if ok_rows:
+        st.markdown("---")
+        st.markdown("### ✅ Renamed Files")
+        for r in ok_rows:
+            st.markdown(
+                f'<span class="filename-tag">📄 {r["original_name"]}</span>'
+                f' &nbsp;→&nbsp; '
+                f'<span class="new-filename-tag">✓ {r["new_name"]}</span>',
+                unsafe_allow_html=True,
+            )
+
+    if err_rows:
+        st.markdown("---")
+        with st.expander(f"⚠️ {len(err_rows)} file(s) with errors — click to expand"):
+            for r in err_rows:
+                st.markdown(f"**{r['original_name']}** — `{r['status']}`")
+
+    st.markdown("---")
+    st.markdown("### 📊 Full Results Table")
+    df_full = pd.DataFrame([{c: r.get(c, "") for c in display_cols} for r in results])
+    df_full.columns = display_labels
+    st.dataframe(df_full, use_container_width=True, height=320)
+
+    st.markdown("---")
+    st.markdown("### 📥 Downloads")
+    dl1, dl2 = st.columns(2)
+
+    with dl1:
+        if ok_rows:
+            st.download_button(
+                label="📦  Download Renamed PDFs  (ZIP)",
+                data=build_zip(ok_rows),
+                file_name=zip_name,
+                mime="application/zip",
+                use_container_width=True,
+                key=f"dl_zip_{ns}",
+            )
+        else:
+            st.info("No successfully renamed files to download.")
+
+    with dl2:
+        st.download_button(
+            label="📊  Download Summary  (XLSX)",
+            data=xlsx_builder(results),
+            file_name=xlsx_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"dl_xlsx_{ns}",
+        )
+
+    st.markdown("---")
+    _, col_c, _ = st.columns([1, 2, 1])
+    with col_c:
+        if st.button("🔄  Reset — Process New Files", use_container_width=True, key=f"reset_{ns}"):
+            st.session_state[results_key] = []
+            st.session_state[done_key] = False
+            st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB 1 — STANDARD ZÜS RENAMER
+# ══════════════════════════════════════════════════════════════════════════════
+STD_COLS   = ["original_name", "new_name", "zus_unternehmen", "fabriknummer",
+              "ve3", "type", "datum", "pruefungsart_raw", "exam_code", "status"]
+STD_LABELS = ["Original Name", "New Name", "ZÜS Company", "Fabrik-Nr.",
+              "VE3", "Type", "Date", "Prüfungsart (raw)", "Exam Code", "Status"]
+
+
+def render_standard_tab(creds: dict, creds_ok: bool, dic_ok: bool,
+                        ve3_dict: dict, type_dict: dict) -> None:
+    st.markdown(
+        '<p style="color:#6b7280;font-size:0.95rem;margin:0 0 4px 0;">'
+        'Renames to <code>VE3-DDMMYYYY-HP Aufzug Fabriknummer.pdf</code> '
+        'using the embedded DIC database.</p>',
+        unsafe_allow_html=True,
+    )
+
+    uploaded_files = render_uploader(
+        "std",
+        "Drag &amp; drop one or more PDF files. Each file is processed independently "
+        "through the pipeline.",
+    )
+
+    _, col_c, _ = st.columns([1, 2, 1])
+    with col_c:
+        process_clicked = st.button(
+            "🚀  Process & Rename PDFs",
+            use_container_width=True,
+            type="primary",
+            key="process_std",
+        )
+
+    if process_clicked:
+        if not uploaded_files:
+            st.error("Please upload at least one PDF file.")
+        elif not creds_ok:
+            st.error("Azure credentials are missing. Configure them in the Admin panel.")
+        elif not dic_ok:
+            st.error("DIC table could not be loaded. Set DIC_TABLE_B64 in secrets, "
+                     "or place 'DIC (ve3+type).xlsx' in the app folder.")
+        else:
+            adi_client, oai_client, deploy = make_clients(get_credentials())
+            run_batch(
+                uploaded_files,
+                lambda name, data, existing: process_pdf(
+                    name, data, adi_client, oai_client, deploy,
+                    ve3_dict, type_dict, existing,
+                ),
+                results_key="results",
+                live_cols=["original_name", "new_name", "ve3", "type", "datum", "exam_code", "status"],
+                live_labels=["Original", "New Name", "VE3", "Type", "Date", "Code", "Status"],
+            )
+            st.session_state.processing_done = True
+
+    if st.session_state.results:
+        render_results(
+            results=st.session_state.results,
+            display_cols=STD_COLS,
+            display_labels=STD_LABELS,
+            xlsx_builder=build_xlsx,
+            zip_name="renamed_pdfs.zip",
+            xlsx_name="zus_pipeline_output.xlsx",
+            results_key="results",
+            done_key="processing_done",
+            ns="std",
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB 2 — GESOBAU_ZÜS
+# ══════════════════════════════════════════════════════════════════════════════
+def render_gesobau_tab(creds: dict, creds_ok: bool, gesobau_ok: bool,
+                       exact: dict, upper: dict, digits: dict) -> None:
+    st.markdown(
+        '<p style="color:#6b7280;font-size:0.95rem;margin:0 0 4px 0;">'
+        'GESOBAU AG only. Renames to <code>HP-Senftenberger Ring 37-10987474.pdf</code> — '
+        'inspection type, street and Fabriknummer.</p>',
+        unsafe_allow_html=True,
+    )
+
+    uploaded_files = render_uploader(
+        "gesobau",
+        "Drag &amp; drop one or more GESOBAU inspection PDFs (mostly TÜV Thüringen). "
+        "The street is resolved from the Fabriknummer.",
+    )
+
+    _, col_c, _ = st.columns([1, 2, 1])
+    with col_c:
+        process_clicked = st.button(
+            "🚀  Process & Rename PDFs",
+            use_container_width=True,
+            type="primary",
+            key="process_gesobau",
+        )
+
+    if process_clicked:
+        if not uploaded_files:
+            st.error("Please upload at least one PDF file.")
+        elif not creds_ok:
+            st.error("Azure credentials are missing. Configure them in the Admin panel.")
+        elif not gesobau_ok:
+            st.error("Gesobau masterlist could not be loaded. Set GESOBAU_TABLE_B64 in secrets, "
+                     f"or place '{GESOBAU_XLSX}' in the app folder.")
+        else:
+            adi_client, oai_client, deploy = make_clients(get_credentials())
+            run_batch(
+                uploaded_files,
+                lambda name, data, existing: process_pdf_gesobau(
+                    name, data, adi_client, oai_client, deploy,
+                    exact, upper, digits, existing,
+                ),
+                results_key="results_gesobau",
+                live_cols=["original_name", "new_name", "exam_code", "strasse", "fabriknummer", "status"],
+                live_labels=["Original", "New Name", "Code", "Straße", "Fabrik-Nr.", "Status"],
+            )
+            st.session_state.processing_done_gesobau = True
+
+    if st.session_state.results_gesobau:
+        render_results(
+            results=st.session_state.results_gesobau,
+            display_cols=GESOBAU_COLS,
+            display_labels=GESOBAU_LABELS,
+            xlsx_builder=build_xlsx_gesobau,
+            zip_name="gesobau_renamed_pdfs.zip",
+            xlsx_name="gesobau_pipeline_output.xlsx",
+            results_key="results_gesobau",
+            done_key="processing_done_gesobau",
+            ns="gesobau",
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
+def render_sidebar(creds: dict, creds_ok: bool,
+                   dic_ok: bool, dic_count: int,
+                   gesobau_ok: bool, gesobau_count: int) -> None:
     with st.sidebar:
         st.markdown(
             "<h2 style='color:#e2e8f0;margin-top:0;'>📄 ZÜS PDF Renamer</h2>",
@@ -618,13 +1251,24 @@ def main() -> None:
         )
         st.divider()
 
-        # System status
-        st.markdown("<p style='color:#cbd5e1;font-weight:600;margin-bottom:8px;'>System Status</p>", unsafe_allow_html=True)
+        st.markdown(
+            "<p style='color:#cbd5e1;font-weight:600;margin-bottom:8px;'>System Status</p>",
+            unsafe_allow_html=True,
+        )
 
         if dic_ok:
-            st.markdown(f'<div class="status-ok">✓ DIC Database ({dic_count:,} records)</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="status-ok">✓ DIC Database ({dic_count:,} records)</div>',
+                        unsafe_allow_html=True)
         else:
-            st.markdown('<div class="status-err">✗ DIC Database — file missing</div>', unsafe_allow_html=True)
+            st.markdown('<div class="status-err">✗ DIC Database — not configured</div>',
+                        unsafe_allow_html=True)
+
+        if gesobau_ok:
+            st.markdown(f'<div class="status-ok">✓ Gesobau Masterlist ({gesobau_count:,} lifts)</div>',
+                        unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="status-err">✗ Gesobau Masterlist — not configured</div>',
+                        unsafe_allow_html=True)
 
         if creds_ok:
             st.markdown('<div class="status-ok">✓ Azure Credentials</div>', unsafe_allow_html=True)
@@ -633,7 +1277,6 @@ def main() -> None:
 
         st.divider()
 
-        # Admin panel
         with st.expander("🔐 Admin Configuration"):
             if not st.session_state.admin_authenticated:
                 st.markdown(
@@ -699,10 +1342,37 @@ def main() -> None:
                     st.session_state.admin_authenticated = False
                     st.rerun()
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+def main() -> None:
+    init_session_state()
+
+    # Embedded lookup databases
+    dic_ok, ve3_dict, type_dict, dic_count = False, {}, {}, 0
+    try:
+        ve3_dict, type_dict, dic_count = load_dic_data()
+        dic_ok = True
+    except Exception as exc:
+        logger.error("DIC load failed: %s", exc)
+
+    gesobau_ok, g_exact, g_upper, g_digits, gesobau_count = False, {}, {}, {}, 0
+    try:
+        g_exact, g_upper, g_digits, gesobau_count = load_gesobau_data()
+        gesobau_ok = True
+    except Exception as exc:
+        logger.error("Gesobau masterlist load failed: %s", exc)
+
+    creds    = get_credentials()
+    creds_ok = credentials_valid(creds)
+
+    render_sidebar(creds, creds_ok, dic_ok, dic_count, gesobau_ok, gesobau_count)
+
     # ── HERO ─────────────────────────────────────────────────────────────────
     st.markdown(
         """
-        <div style="text-align:center;padding:2.5rem 0 1.5rem 0;">
+        <div style="text-align:center;padding:2.5rem 0 1rem 0;">
             <div class="hero-title">ZÜS PDF Renamer</div>
             <div class="hero-subtitle">
                 Upload ZÜS inspection reports and get them automatically renamed.
@@ -719,191 +1389,13 @@ def main() -> None:
             "or add them to `.streamlit/secrets.toml`."
         )
 
-    # ── FILE UPLOADER ─────────────────────────────────────────────────────────
-    st.markdown("### 📂 Upload ZÜS Inspection PDFs")
-    st.markdown(
-        "<p style='color:#6b7280;font-size:0.9rem;margin-top:-8px;'>"
-        "Drag & drop one or more PDF files. Each file is processed independently through the pipeline.</p>",
-        unsafe_allow_html=True,
-    )
+    tab_std, tab_gesobau = st.tabs(["📄  ZÜS Renamer", "🏢  Gesobau_ZÜS"])
 
-    uploaded_files = st.file_uploader(
-        "Upload PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
-        label_visibility="collapsed",
-    )
+    with tab_std:
+        render_standard_tab(creds, creds_ok, dic_ok, ve3_dict, type_dict)
 
-    if uploaded_files:
-        st.markdown(
-            f"<p style='color:#374151;font-weight:600;margin-top:12px;'>"
-            f"{len(uploaded_files)} file(s) selected:</p>",
-            unsafe_allow_html=True,
-        )
-        pills = " ".join(
-            f'<span class="filename-tag">📄 {f.name}</span>' for f in uploaded_files
-        )
-        st.markdown(pills, unsafe_allow_html=True)
-
-    # ── PROCESS BUTTON ────────────────────────────────────────────────────────
-    col_l, col_c, col_r = st.columns([1, 2, 1])
-    with col_c:
-        process_clicked = st.button(
-            "🚀  Process & Rename PDFs",
-            use_container_width=True,
-            type="primary",
-        )
-
-    if process_clicked:
-        if not uploaded_files:
-            st.error("Please upload at least one PDF file.")
-        elif not creds_ok:
-            st.error("Azure credentials are missing. Configure them in the Admin panel.")
-        elif not dic_ok:
-            st.error("DIC database could not be loaded. Ensure 'DIC (ve3+type).xlsx' is in the app folder.")
-        else:
-            creds = get_credentials()
-            adi_client = DocumentIntelligenceClient(
-                endpoint=creds["di_endpoint"],
-                credential=AzureKeyCredential(creds["di_key"]),
-            )
-            oai_client = AzureOpenAI(
-                azure_endpoint=creds["oai_endpoint"],
-                api_key=creds["oai_key"],
-                api_version=creds["oai_version"],
-            )
-            deploy = creds["oai_deploy"]
-
-            st.session_state.results = []
-            existing_names: set = set()
-
-            progress_bar    = st.progress(0.0, text="Initialising pipeline…")
-            status_slot     = st.empty()
-            live_table_slot = st.empty()
-
-            for idx, pdf_file in enumerate(uploaded_files):
-                frac = idx / len(uploaded_files)
-                progress_bar.progress(frac, text=f"Processing {pdf_file.name}  ({idx + 1}/{len(uploaded_files)})…")
-                status_slot.info(f"⏳  Processing **{pdf_file.name}**…")
-
-                file_bytes = pdf_file.read()
-                row = process_pdf(
-                    pdf_file.name, file_bytes,
-                    adi_client, oai_client, deploy,
-                    ve3_dict, type_dict, existing_names,
-                )
-                st.session_state.results.append(row)
-
-                # Live preview of results so far
-                preview_cols = ["original_name", "new_name", "ve3", "type", "datum", "exam_code", "status"]
-                df_live = pd.DataFrame(
-                    [{c: r.get(c, "") for c in preview_cols} for r in st.session_state.results]
-                )
-                df_live.columns = ["Original", "New Name", "VE3", "Type", "Date", "Code", "Status"]
-                live_table_slot.dataframe(df_live, use_container_width=True)
-
-            progress_bar.progress(1.0, text="Pipeline complete!")
-            status_slot.success(f"✅  Finished — {len(uploaded_files)} file(s) processed.")
-            st.session_state.processing_done = True
-
-    # ── RESULTS ───────────────────────────────────────────────────────────────
-    if st.session_state.results:
-        results  = st.session_state.results
-        ok_rows  = [r for r in results if r["status"] == "OK"]
-        err_rows = [r for r in results if r["status"] != "OK"]
-
-        st.markdown("---")
-
-        # Metric cards
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-number" style="color:#6366f1;">'
-                f'{len(results)}</div><div class="metric-label">Files Processed</div></div>',
-                unsafe_allow_html=True,
-            )
-        with c2:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-number" style="color:#10b981;">'
-                f'{len(ok_rows)}</div><div class="metric-label">Successfully Renamed</div></div>',
-                unsafe_allow_html=True,
-            )
-        with c3:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-number" style="color:#ef4444;">'
-                f'{len(err_rows)}</div><div class="metric-label">Errors / Skipped</div></div>',
-                unsafe_allow_html=True,
-            )
-
-        # Rename mapping
-        if ok_rows:
-            st.markdown("---")
-            st.markdown("### ✅ Renamed Files")
-            for r in ok_rows:
-                st.markdown(
-                    f'<span class="filename-tag">📄 {r["original_name"]}</span>'
-                    f' &nbsp;→&nbsp; '
-                    f'<span class="new-filename-tag">✓ {r["new_name"]}</span>',
-                    unsafe_allow_html=True,
-                )
-
-        # Error details
-        if err_rows:
-            st.markdown("---")
-            with st.expander(f"⚠️ {len(err_rows)} file(s) with errors — click to expand"):
-                for r in err_rows:
-                    st.markdown(f"**{r['original_name']}** — `{r['status']}`")
-
-        # Full results table
-        st.markdown("---")
-        st.markdown("### 📊 Full Results Table")
-        display_cols = [
-            "original_name", "new_name", "zus_unternehmen", "fabriknummer",
-            "ve3", "type", "datum", "pruefungsart_raw", "exam_code", "status",
-        ]
-        df_full = pd.DataFrame([{c: r.get(c, "") for c in display_cols} for r in results])
-        df_full.columns = [
-            "Original Name", "New Name", "ZÜS Company", "Fabrik-Nr.",
-            "VE3", "Type", "Date", "Prüfungsart (raw)", "Exam Code", "Status",
-        ]
-        st.dataframe(df_full, use_container_width=True, height=320)
-
-        # Downloads
-        st.markdown("---")
-        st.markdown("### 📥 Downloads")
-        dl1, dl2 = st.columns(2)
-
-        with dl1:
-            if ok_rows:
-                zip_bytes = build_zip(ok_rows)
-                st.download_button(
-                    label="📦  Download Renamed PDFs  (ZIP)",
-                    data=zip_bytes,
-                    file_name="renamed_pdfs.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                )
-            else:
-                st.info("No successfully renamed files to download.")
-
-        with dl2:
-            xlsx_bytes = build_xlsx(results)
-            st.download_button(
-                label="📊  Download Summary  (XLSX)",
-                data=xlsx_bytes,
-                file_name="zus_pipeline_output.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-
-        # Reset
-        st.markdown("---")
-        col_l2, col_c2, col_r2 = st.columns([1, 2, 1])
-        with col_c2:
-            if st.button("🔄  Reset — Process New Files", use_container_width=True):
-                st.session_state.results = []
-                st.session_state.processing_done = False
-                st.rerun()
+    with tab_gesobau:
+        render_gesobau_tab(creds, creds_ok, gesobau_ok, g_exact, g_upper, g_digits)
 
 
 if __name__ == "__main__":
