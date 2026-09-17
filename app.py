@@ -1112,13 +1112,6 @@ STD_LABELS = ["Original Name", "New Name", "ZÜS Company", "Fabrik-Nr.",
 
 def render_standard_tab(creds: dict, creds_ok: bool, dic_ok: bool,
                         ve3_dict: dict, type_dict: dict) -> None:
-    st.markdown(
-        '<p style="color:#6b7280;font-size:0.95rem;margin:0 0 4px 0;">'
-        'Renames to <code>VE3-DDMMYYYY-HP Aufzug Fabriknummer.pdf</code> '
-        'using the embedded DIC database.</p>',
-        unsafe_allow_html=True,
-    )
-
     uploaded_files = render_uploader(
         "std",
         "Drag &amp; drop one or more PDF files. Each file is processed independently "
@@ -1175,13 +1168,6 @@ def render_standard_tab(creds: dict, creds_ok: bool, dic_ok: bool,
 # ══════════════════════════════════════════════════════════════════════════════
 def render_gesobau_tab(creds: dict, creds_ok: bool, gesobau_ok: bool,
                        exact: dict, upper: dict, digits: dict) -> None:
-    st.markdown(
-        '<p style="color:#6b7280;font-size:0.95rem;margin:0 0 4px 0;">'
-        'GESOBAU AG only. Renames to <code>HP-Senftenberger Ring 37-10987474.pdf</code> — '
-        'inspection type, street and Fabriknummer.</p>',
-        unsafe_allow_html=True,
-    )
-
     uploaded_files = render_uploader(
         "gesobau",
         "Drag &amp; drop one or more GESOBAU inspection PDFs (mostly TÜV Thüringen). "
@@ -1389,7 +1375,7 @@ def main() -> None:
             "or add them to `.streamlit/secrets.toml`."
         )
 
-    tab_std, tab_gesobau = st.tabs(["📄  ZÜS Renamer", "🏢  Gesobau_ZÜS"])
+    tab_std, tab_gesobau = st.tabs(["📄  Branicks_ZÜS", "🏢  Gesobau_ZÜS"])
 
     with tab_std:
         render_standard_tab(creds, creds_ok, dic_ok, ve3_dict, type_dict)
