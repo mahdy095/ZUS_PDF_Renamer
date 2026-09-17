@@ -1114,8 +1114,7 @@ def render_standard_tab(creds: dict, creds_ok: bool, dic_ok: bool,
                         ve3_dict: dict, type_dict: dict) -> None:
     uploaded_files = render_uploader(
         "std",
-        "Drag &amp; drop one or more PDF files. Each file is processed independently "
-        "through the pipeline.",
+        "Drag &amp; drop one or more PDF files.",
     )
 
     _, col_c, _ = st.columns([1, 2, 1])
@@ -1170,8 +1169,7 @@ def render_gesobau_tab(creds: dict, creds_ok: bool, gesobau_ok: bool,
                        exact: dict, upper: dict, digits: dict) -> None:
     uploaded_files = render_uploader(
         "gesobau",
-        "Drag &amp; drop one or more GESOBAU inspection PDFs (mostly TÜV Thüringen). "
-        "The street is resolved from the Fabriknummer.",
+        "Drag &amp; drop one or more GESOBAU inspection PDFs.",
     )
 
     _, col_c, _ = st.columns([1, 2, 1])
